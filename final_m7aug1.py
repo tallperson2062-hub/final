@@ -6,7 +6,81 @@ Tab 2: Step-by-Step Watershed Segmentation using Sobel Gradient & Histogram Mark
 Tab 3: Batch Image Processing with Indicator Classification
 """
 
+# ============================================================================
+# Lightweight imports only, so far.
+#
+# `sys`/`os` are needed immediately to detect a frozen PyInstaller .exe, and
+# `tkinter` is needed to show the startup loading popup below. The heavier
+# libraries (cv2, scipy, PIL, ...) are imported further down, AFTER the
+# popup is already on screen, so the popup appears the instant the process
+# starts rather than after those slower imports finish.
+# ============================================================================
+import sys
+import os
+import copy
 import tkinter as tk
+
+
+# ============================================================================
+# Startup loading popup (Change 5)
+#
+# When the app is packaged as a Windows .exe with PyInstaller, there is a
+# noticeable delay while the interpreter and its (fairly heavy) libraries
+# load, during which the user sees nothing happening. This shows a small,
+# borderless "Application is loading, please wait..." popup immediately,
+# keeps it on screen while the rest of module import / GUI setup runs, and
+# closes it automatically (no click required) once the main window is
+# ready. When running as a plain .py script this is skipped entirely,
+# since startup is already fast and no popup is needed.
+# ============================================================================
+def _show_startup_splash():
+    """Show the startup popup and return its Tk root (or None if skipped)."""
+    if not getattr(sys, 'frozen', False):
+        return None
+    try:
+        splash_root = tk.Tk()
+        splash_root.overrideredirect(True)  # borderless: no title bar/buttons
+        splash_root.configure(bg='#1e2328')
+        width, height = 380, 110
+        splash_root.update_idletasks()
+        sw = splash_root.winfo_screenwidth()
+        sh = splash_root.winfo_screenheight()
+        x = (sw - width) // 2
+        y = (sh - height) // 2
+        splash_root.geometry(f"{width}x{height}+{x}+{y}")
+        try:
+            splash_root.attributes('-topmost', True)
+        except Exception:
+            pass  # not fatal if the platform/WM doesn't support it
+        tk.Label(splash_root, text="Application is loading, please wait...",
+                 bg='#1e2328', fg='#dde3ea',
+                 font=('Segoe UI', 11, 'bold'),
+                 wraplength=340, justify='center').pack(expand=True, fill='both',
+                                                        padx=18, pady=18)
+        splash_root.update()
+        return splash_root
+    except Exception:
+        # A splash failure must never prevent the real application from
+        # starting.
+        return None
+
+
+def _close_startup_splash(splash_root):
+    """Close the popup created by _show_startup_splash, if one was shown."""
+    if splash_root is not None:
+        try:
+            splash_root.destroy()
+        except Exception:
+            pass
+
+
+# Show the popup (frozen .exe only) before the slower imports below run.
+_startup_splash = _show_startup_splash()
+
+# ============================================================================
+# Remaining imports. Kept after the startup splash above so the popup is
+# already visible while these (heavier) imports execute.
+# ============================================================================
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import tkinter.font as tkfont
 from PIL import Image, ImageTk
@@ -15,10 +89,7 @@ import numpy as np
 from scipy import ndimage as ndi
 import json
 import math
-import os
-import sys
 import gc
-import copy
 import threading
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -33,92 +104,26 @@ from pathlib import Path
 #   - sys._MEIPASS points to the read-only temp extraction folder
 #   - __file__ resolves inside that same read-only temp folder
 #
-# For any FILES THE APP WRITES, this is the directory that contains the
-# .exe itself — that is always writable and is where the user expects
-# application data to live alongside the executable. When running as a
-# plain .py script the behaviour is unchanged.
-#
-# NOTE: the app no longer reads or writes a "configurations/conf.json" file
-# (all default configuration values are now hardcoded — see DEFAULT_CONFIG
-# near the top of this file), so this helper is currently unused by that
-# feature. It is kept as a general-purpose utility in case any future
-# feature needs a writable, exe-relative directory.
+# MODIFIED (Change 2): the app no longer auto-creates a 'configurations'
+# folder next to the .exe (its default config now lives in code -- see
+# DEFAULT_CONFIG -- so nothing needs to be written there any more). This
+# helper is kept as a general-purpose utility for resolving a writable,
+# user-visible base directory (e.g. for the Save/Load dialogs' initial
+# folder) -- just never use Path(__file__).resolve().parent directly for
+# that, since it points into the read-only PyInstaller temp folder
+# (_MEIPASS) when the app is frozen.
 # ============================================================================
 def _get_app_dir() -> Path:
-    """Return the writable base directory for application data.
+    """Return a writable base directory for application data.
 
     * Frozen .exe  → directory that contains the .exe  (sys.executable parent)
     * Plain script → directory that contains this .py  (__file__ parent)
-
-    Use this wherever the application needs to READ or WRITE persistent
-    files. Never use Path(__file__).resolve().parent directly, because
-    __file__ points into the read-only PyInstaller temp folder (_MEIPASS)
-    when the app is frozen.
     """
     if getattr(sys, 'frozen', False):
         # Running as a PyInstaller-frozen executable
         return Path(sys.executable).resolve().parent
     # Running as a regular Python script
     return Path(__file__).resolve().parent
-
-
-# ============================================================================
-# Hardcoded default configuration (Change: remove dependency on external
-# conf.json).
-#
-# This dictionary holds the EXACT values that used to live in the external
-# conf.json file shipped next to the app. It is now baked directly into the
-# source so the application never requires a conf.json file to exist on
-# disk in order to start up or run.
-#
-# These values are only the INITIAL / FALLBACK defaults:
-#   * image_path      -> overwritten as soon as the user selects an image.
-#   * image_shape      -> overwritten automatically from the selected image.
-#   * polygon_points  -> overwritten by the user's ROI / polygon selection.
-#   * pipeline_params -> initialised from these defaults, then freely
-#                         modified at runtime by the existing GUI controls
-#                         (sliders / checkboxes / spinboxes for each step).
-#
-# Use get_default_config() to obtain a fresh, mutable deep copy   never
-# mutate DEFAULT_CONFIG itself, or every caller that asks for "the
-# defaults" later will see the mutated values.
-# ============================================================================
-DEFAULT_CONFIG = {
-    "image_path": "C:/Users/manu/Pictures/Screenshots/Screenshot (2).png",
-    "image_shape": [1080, 1920],
-    "polygon_points": [
-        [504, 712],
-        [785, 590],
-        [902, 785],
-        [564, 938],
-    ],
-    "pipeline_params": {
-        "step_2_rotate_flip": {"enabled": True, "rotate": 0, "flip_h": False, "flip_v": False},
-        "step_3_grayscale": {"enabled": True},
-        "step_4_sobel": {"enabled": True},
-        "step_5_markers": {"enabled": True, "low_threshold": 30, "high_threshold": 150},
-        "step_6_watershed": {"enabled": True},
-        "step_7_morph_close": {"enabled": True, "iterations": 2},
-        "step_8_morph_open": {"enabled": True, "iterations": 2},
-        "step_9_fillholes": {"enabled": True},
-        "step_10_labeling": {"enabled": True, "min_size": 0},
-        "step_11_final": {"min_area": 0, "max_area": 10000},
-        "step_12_perspective": {"enabled": True},
-    },
-}
-
-
-def get_default_config():
-    """Return a fresh, independent deep copy of DEFAULT_CONFIG.
-
-    Always use this instead of touching DEFAULT_CONFIG directly, so that
-    in-memory mutations made by one tab/session never leak into what
-    another part of the app considers "the defaults".
-    """
-    return copy.deepcopy(DEFAULT_CONFIG)
-# ============================================================================
-# END hardcoded default configuration
-# ============================================================================
 
 
 # ============================================================================
@@ -165,6 +170,45 @@ def _resolve_font_mono():
 # ============================================================================
 
 
+# ============================================================================
+# Built-in default configuration (Change 1)
+#
+# This mirrors the external conf.json this app previously required, so the
+# app no longer depends on that file being present on disk. These are the
+# INITIAL / DEFAULT values only:
+#   - image_path      -> updated automatically once the user selects an image
+#   - image_shape      -> updated automatically from the selected image
+#   - polygon_points   -> updated automatically from the user's ROI selection
+#   - pipeline_params  -> initialised from these defaults, then updated live
+#                          by the existing Step 2-12 GUI controls
+#
+# Always deep-copy this dict before handing it to any tab (see
+# copy.deepcopy(DEFAULT_CONFIG[...]) below) so that one tab's edits never
+# silently mutate another tab's (or a later run's) starting defaults.
+# ============================================================================
+DEFAULT_CONFIG = {
+    "image_path": "C:/Users/manu/Pictures/Screenshots/Screenshot (2).png",
+    "image_shape": [1080, 1920],
+    "polygon_points": [
+        [504, 712],
+        [785, 590],
+        [902, 785],
+        [564, 938],
+    ],
+    "pipeline_params": {
+        "step_2_rotate_flip":  {"enabled": True, "rotate": 0, "flip_h": False, "flip_v": False},
+        "step_3_grayscale":    {"enabled": True},
+        "step_4_sobel":        {"enabled": True},
+        "step_5_markers":      {"enabled": True, "low_threshold": 30, "high_threshold": 150},
+        "step_6_watershed":    {"enabled": True},
+        "step_7_morph_close":  {"enabled": True, "iterations": 2},
+        "step_8_morph_open":   {"enabled": True, "iterations": 2},
+        "step_9_fillholes":    {"enabled": True},
+        "step_10_labeling":    {"enabled": True, "min_size": 0},
+        "step_11_final":       {"min_area": 0, "max_area": 10000},
+        "step_12_perspective": {"enabled": True},
+    },
+}
 
 
 
@@ -176,13 +220,6 @@ class ImageAnalyzerApp:
         self.root.title("")
         self.root.geometry("1400x900")
         self.root.configure(bg='#1e2328')
-
-        # ── Hardcoded default configuration (replaces external conf.json) ──
-        # A fresh deep copy is kept on the instance so every tab can read
-        # (and, where the GUI allows, override) the same starting values for
-        # image_path / image_shape / polygon_points / pipeline_params
-        # without ever needing an external conf.json file on disk.
-        self.default_config = get_default_config()
 
         # ── MODIFIED (Change 4   Application Font): resolve a modern,
         # professional font family once, then reference self.FONT /
@@ -529,13 +566,13 @@ class ImageAnalyzerApp:
     def _init_tab_batch_3d(self):
         """Initialize the merged Batch Processing & 3D Visualization tab."""
         self.tab3_input_folder = None
-        # Initialised with the hardcoded defaults (formerly loaded from an
-        # external conf.json) so Batch Processing / 3D Visualise always has
-        # a valid configuration to fall back on. Loading a config file via
-        # "Load Configuration" or auto-loading a per-folder config still
-        # overrides this at runtime, exactly as before.
-        self.tab3_config_data  = copy.deepcopy(self.default_config)
-        self.tab3_roi_points   = None
+        # MODIFIED (Change 1): pre-seed with the built-in defaults (formerly
+        # read from external conf.json) so Batch Processing has a working
+        # ROI + pipeline configuration immediately, with no file required.
+        # Loading a config/ROI file (if the user does so) still overrides
+        # these, exactly as before.
+        self.tab3_config_data  = copy.deepcopy(DEFAULT_CONFIG)
+        self.tab3_roi_points   = np.array(DEFAULT_CONFIG['polygon_points'], dtype=np.int32)
         self.tab3_processing   = False
         self._batch3d_stop_flag = False   # set True by Stop button
 
@@ -735,16 +772,23 @@ class ImageAnalyzerApp:
         self.tab3_log_text.pack(fill='both', expand=True)
         log_sb.config(command=self.tab3_log_text.yview)
 
-        # ── Configuration defaults ─────────────────────────────────────────
-        # No external conf.json is loaded here any more   self.tab3_config_data
-        # already holds the hardcoded DEFAULT_CONFIG values set above. A
-        # per-folder Configurations/config.json (if the user has one next to
-        # their images) can still override it, see _batch3d_pick_input_folder.
+        # ── Auto-load conf.json ───────────────────────────────────────────
+       
 
     # ── Merged tab helpers ───────────────────────────────────────────────
 
     def _batch3d_pick_input_folder(self):
-        """Pick input folder and auto-load config.json from Configurations/ subfolder."""
+        """Pick input folder for batch processing.
+
+        MODIFIED (Change 1): the app no longer REQUIRES an external
+        conf.json / config.json to run -- self.tab3_config_data and
+        self.tab3_roi_points are already pre-seeded with the built-in
+        defaults (see DEFAULT_CONFIG and _init_tab_batch_3d). If the user
+        happens to have placed a 'Configurations/config.json' next to (or
+        one level above) the chosen input folder, it is still loaded as an
+        optional override of those defaults -- purely a convenience, not a
+        requirement.
+        """
         folder_path = filedialog.askdirectory(title='Select Input Images Folder')
         if not folder_path:
             return
@@ -752,12 +796,9 @@ class ImageAnalyzerApp:
         self._tab3_folder_var.set(folder_path)
         self.tab3_log(f"Input folder selected: {folder_path}")
 
-        # Auto-load Configurations/config.json relative to the input folder,
-        # if the user happens to have one saved alongside their images. This
-        # is purely optional and dynamic   no external conf.json is required
-        # for the app to work; self.tab3_config_data already holds the
-        # hardcoded defaults set in _init_tab_batch_3d and will simply keep
-        # using them if no per-folder config is found.
+        # Optional convenience override: a user-supplied config file next to
+        # the input folder, if present. Not required -- built-in defaults
+        # are already active regardless.
         conf_candidates = [
             os.path.join(folder_path, 'Configurations', 'config.json'),
             os.path.join(folder_path, '..', 'Configurations', 'config.json'),
@@ -778,7 +819,8 @@ class ImageAnalyzerApp:
                 except Exception as e:
                     self.tab3_log(f"Could not load config from {conf_path}: {e}")
         if not loaded:
-            self.tab3_log("No per-folder configuration file found   using built-in defaults.")
+            self.tab3_log("No configuration file found next to the input folder "
+                          "  using built-in default configuration.")
 
     def _batch3d_stop(self):
         """Signal running task to stop."""
@@ -827,26 +869,29 @@ class ImageAnalyzerApp:
             if os.path.isfile(os.path.join(self.tab3_input_folder, f))
             and any(f.lower().endswith(ext) for ext in image_extensions)
         ]
+
+        # MODIFIED (Change 3): ignore the first 5 images, processing only
+        # from the 6th image onward. The discovery/ordering above is
+        # unchanged -- only the images actually processed are trimmed.
+        _SKIP_FIRST_N = 5
+        total_found   = len(image_files)
+        skipped_count = min(_SKIP_FIRST_N, total_found)
+        image_files   = image_files[_SKIP_FIRST_N:]
+
         if not image_files:
-            messagebox.showwarning('Start', 'No image files found in selected folder.')
+            if total_found:
+                messagebox.showwarning(
+                    'Start',
+                    f'{total_found} image(s) were found, but the first {_SKIP_FIRST_N} '
+                    'are always ignored, leaving nothing to process.')
+            else:
+                messagebox.showwarning('Start', 'No image files found in selected folder.')
             self.tab3_processing = False
             self._batch3d_start_btn.config(state='normal')
             return
 
-        # Ignore the first 5 images; process only from the 6th image onward.
-        # Ordering is left exactly as collected above   only the slicing is new.
-        skipped_count = min(5, len(image_files))
-        image_files = image_files[5:]
-        if not image_files:
-            messagebox.showwarning(
-                'Start',
-                f'Only {skipped_count} image(s) found in the selected folder; '
-                'the first 5 images are skipped, leaving nothing to process.')
-            self.tab3_processing = False
-            self._batch3d_start_btn.config(state='normal')
-            return
-
-        self.tab3_log(f"Skipping first {skipped_count} image(s) as configured.")
+        if skipped_count:
+            self.tab3_log(f"Ignoring the first {skipped_count} image(s) as configured.")
         self.tab3_log(f"\nFound {len(image_files)} image(s) to process")
 
         defects_path     = os.path.join(output_base, 'indicators')
@@ -1155,20 +1200,29 @@ class ImageAnalyzerApp:
                 self.root.after(0, lambda: self._batch3d_status_lbl.config(text='3D Viz skipped (no PNGs)'))
                 return
 
-            # Ignore the first 5 images, same rule as Batch Processing;
-            # process only from the 6th image onward. Ordering (sorted by
-            # subfolder, then filename) is left exactly as collected above.
-            _skipped_3d = min(5, len(png_entries))
-            png_entries = png_entries[5:]
+            # MODIFIED (Change 3): ignore the first 5 images here too,
+            # using from the 6th image onward. Discovery/ordering (sorted
+            # per-subfolder, as above) is unchanged -- only the images fed
+            # into the 3D reconstruction are trimmed.
+            _SKIP_FIRST_N = 5
+            if len(png_entries) > _SKIP_FIRST_N:
+                skipped_count = _SKIP_FIRST_N
+                png_entries = png_entries[_SKIP_FIRST_N:]
+            else:
+                skipped_count = len(png_entries)
+                png_entries = []
+
+            if skipped_count:
+                self.root.after(0, lambda n=skipped_count: self.tab3_log(
+                    f"Ignoring the first {n} image(s) as configured."))
+
             if not png_entries:
                 self.root.after(0, lambda: self.tab3_log(
-                    f"Only {_skipped_3d} PNG(s) found; the first 5 are skipped, "
-                    "leaving nothing to visualize."))
+                    "No PNG files remain for 3D Visualization after ignoring "
+                    f"the first {_SKIP_FIRST_N} image(s)."))
                 self.root.after(0, lambda: self._batch3d_set_progress(100))
                 self.root.after(0, lambda: self._batch3d_status_lbl.config(text='3D Viz skipped (no PNGs)'))
                 return
-            self.root.after(0, lambda: self.tab3_log(
-                f"Skipping first {_skipped_3d} image(s) as configured."))
 
             png_files = [path for _, path in png_entries]
             from collections import Counter as _Counter
@@ -2146,11 +2200,13 @@ Mesh.export([mesh_obj], r"{stl_file}")
         self.step1_polygon_closed = False
         self._roi_save_dir = None
 
-        # Default parameters for each step
-        # Initialised from the hardcoded DEFAULT_CONFIG (formerly conf.json).
-        # A fresh deep copy is used so mutating self.params via the GUI
-        # controls below never touches self.default_config / DEFAULT_CONFIG.
-        self.params = copy.deepcopy(self.default_config['pipeline_params'])
+        # Default parameters for each step.
+        # MODIFIED (Change 1): sourced from the built-in DEFAULT_CONFIG
+        # (formerly conf.json) instead of a separate hardcoded literal, so
+        # there is a single source of truth for the default pipeline
+        # parameters. A deep copy is used so edits made via the Step 2-12
+        # GUI controls below never mutate DEFAULT_CONFIG itself.
+        self.params = copy.deepcopy(DEFAULT_CONFIG['pipeline_params'])
 
         frame = self.tab2  # == self.tab_frames['single']
         frame.configure(bg=self.BG)
@@ -2501,12 +2557,10 @@ Mesh.export([mesh_obj], r"{stl_file}")
         with open(roi_path, 'w') as f:
             json.dump(data, f, indent=4)
 
-        # NOTE: this used to also write a copy to a "configurations/conf.json"
-        # folder created next to the app/exe so the Batch tab could auto-load
-        # it. That folder is no longer created automatically   configuration
-        # defaults are now hardcoded in the source (see DEFAULT_CONFIG) and
-        # per-image ROI/config JSON files are saved only where the user
-        # explicitly asked for them (next to the image, or via Save Config).
+        # MODIFIED (Change 2): no longer auto-creates/writes a
+        # 'configurations' folder alongside the app / .exe. Batch
+        # Processing already has its own built-in default configuration
+        # (see DEFAULT_CONFIG) and no longer needs this file to exist.
 
         # Remember save folder so Save Config lands in same place
         self._roi_save_dir = img_dir
@@ -3374,11 +3428,10 @@ Mesh.export([mesh_obj], r"{stl_file}")
             with open(save_path, 'w') as f:
                 json.dump(data, f, indent=4)
 
-            # NOTE: this used to also write a copy to an auto-created
-            # "configurations/conf.json" folder so the Batch tab could
-            # auto-load it. That folder is no longer created automatically;
-            # the file the user explicitly chose above is the only copy
-            # written to disk.
+            # MODIFIED (Change 2): no longer auto-creates/writes a
+            # 'configurations' folder alongside the app / .exe. Batch
+            # Processing already has its own built-in default configuration
+            # (see DEFAULT_CONFIG) and no longer needs this file to exist.
 
             messagebox.showinfo("Success", f"Configuration saved to {save_path}")
 
@@ -3553,20 +3606,6 @@ Mesh.export([mesh_obj], r"{stl_file}")
             self._batch3d_start_btn.config(state='normal')
             return
 
-        # Ignore the first 5 images; process only from the 6th image onward.
-        # Ordering is left exactly as collected above   only the slicing is new.
-        skipped_count = min(5, len(image_files))
-        image_files = image_files[5:]
-        if not image_files:
-            messagebox.showwarning(
-                "Warning",
-                f"Only {skipped_count} image(s) found in the selected folder; "
-                "the first 5 images are skipped, leaving nothing to process.")
-            self.tab3_processing = False
-            self._batch3d_start_btn.config(state='normal')
-            return
-
-        self.tab3_log(f"Skipping first {skipped_count} image(s) as configured.")
         self.tab3_log(f"\nFound {len(image_files)} image(s) to process")
 
         # Output folders
@@ -3680,12 +3719,14 @@ Mesh.export([mesh_obj], r"{stl_file}")
             h, w = cv_image.shape[:2]
             roi_points = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype=np.int32)
 
-        # Get parameters from config, or fall back to the hardcoded defaults
+        # Get parameters from config, or fall back to built-in defaults
         # Keys match exactly those used by the Single Image (Tab 2) pipeline
+        # MODIFIED (Change 1): fallback now sourced from DEFAULT_CONFIG
+        # (formerly conf.json) instead of a separate hardcoded literal.
         if self.tab3_config_data and 'pipeline_params' in self.tab3_config_data:
             params = self.tab3_config_data['pipeline_params']
         else:
-            params = get_default_config()['pipeline_params']
+            params = copy.deepcopy(DEFAULT_CONFIG['pipeline_params'])
         # Step 1: Apply ROI mask
         mask = np.zeros(cv_image.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [roi_points], 255)
@@ -4363,88 +4404,19 @@ class LoginWindow:
         _launch_main()
 
 
-def _show_loading_popup(root):
-    """Create and immediately display a small, borderless "loading" popup
-    on top of the (still-hidden) main window, with no buttons and nothing
-    for the user to click. Caller is responsible for destroying it once the
-    main GUI (ImageAnalyzerApp) has finished building.
-
-    Windows-safe: uses only stdlib tkinter, works both as a plain .py script
-    and as a PyInstaller-frozen .exe.
-    """
-    popup = tk.Toplevel(root)
-    popup.title("")
-    try:
-        popup.overrideredirect(True)   # no title bar / borders
-    except Exception:
-        pass
-    popup.configure(bg='#161b22')
-
-    width, height = 380, 120
-    popup.update_idletasks()
-    sw = popup.winfo_screenwidth()
-    sh = popup.winfo_screenheight()
-    x = (sw - width) // 2
-    y = (sh - height) // 2
-    popup.geometry(f"{width}x{height}+{x}+{y}")
-
-    try:
-        popup.attributes('-topmost', True)
-    except Exception:
-        pass
-
-    # Thin accent bar across the top for a touch of polish, matching the
-    # app's existing dark-steel colour palette.
-    tk.Frame(popup, bg='#2d7dd2', height=3).pack(fill='x', side='top')
-
-    font_family = _resolve_font_family()
-    tk.Label(
-        popup,
-        text="Application is loading, please wait...",
-        bg='#161b22', fg='#e6edf3',
-        font=(font_family, 11),
-        wraplength=340, justify='center'
-    ).pack(expand=True, fill='both', padx=20, pady=20)
-
-    popup.update()
-    return popup
-
-
 def _launch_main():
     root = tk.Tk()
-    # Keep the main window hidden until it is fully built, so the loading
-    # popup below is the only thing visible during startup.
-    root.withdraw()
-
-    # Change: startup loading popup. Anthropic/PyInstaller note: when the
-    # app is packaged as a Windows .exe, the underlying PyInstaller bootstrap
-    # (unpacking, DLL loading) happens before any Python code runs and can't
-    # be intercepted from here — but building the ImageAnalyzerApp GUI itself
-    # (creating every tab, widget, and style) still takes a noticeable moment,
-    # and that is what this popup covers. It appears immediately, requires no
-    # click, and is closed automatically the instant the main GUI is ready.
-    loading_popup = None
-    if getattr(sys, 'frozen', False):
-        try:
-            loading_popup = _show_loading_popup(root)
-        except Exception:
-            loading_popup = None  # never let the popup block startup
-
     app = ImageAnalyzerApp(root)
-
-    if loading_popup is not None:
-        try:
-            loading_popup.destroy()
-        except Exception:
-            pass
-
-    root.deiconify()
+    root.update_idletasks()  # ensure the main window is fully built...
+    _close_startup_splash(_startup_splash)  # ...before closing the popup
     root.mainloop()
 
 
 def _launch_login():
     root = tk.Tk()
     LoginWindow(root)
+    root.update_idletasks()
+    _close_startup_splash(_startup_splash)
     root.mainloop()
 
 
